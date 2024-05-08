@@ -19,12 +19,16 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
-from github import Github as GithubClient
+from github import Auth, Github as GithubClient
 
 from airflow.exceptions import AirflowException
 from airflow.hooks.base import BaseHook
+
+if TYPE_CHECKING:
+    from airflow.models import Connection
 
 
 class GithubHook(BaseHook):
@@ -53,19 +57,13 @@ class GithubHook(BaseHook):
             return self.client
 
         conn = self.get_connection(self.github_conn_id)
-        access_token = conn.password
+        auth = self._get_auth(conn)
         host = conn.host
 
-        # Currently the only method of authenticating to GitHub in Airflow is via a token. This is not the
-        # only means available, but raising an exception to enforce this method for now.
-        # TODO: When/If other auth methods are implemented this exception should be removed/modified.
-        if not access_token:
-            raise AirflowException("An access token is required to authenticate to GitHub.")
-
         if not host:
-            self.client = GithubClient(login_or_token=access_token)
+            self.client = GithubClient(auth=auth)
         else:
-            self.client = GithubClient(login_or_token=access_token, base_url=host)
+            self.client = GithubClient(auth=auth, base_url=host)
 
         return self.client
 
@@ -73,9 +71,23 @@ class GithubHook(BaseHook):
     def get_ui_field_behaviour(cls) -> dict:
         """Return custom field behaviour."""
         return {
-            "hidden_fields": ["schema", "port", "login", "extra"],
-            "relabeling": {"host": "GitHub Enterprise URL (Optional)", "password": "GitHub Access Token"},
-            "placeholders": {"host": "https://{hostname}/api/v3 (for GitHub Enterprise)"},
+            "hidden_fields": ["schema", "port", "login"],
+            "relabeling": {
+                "host": "GitHub Enterprise URL (Optional)",
+                "password": "GitHub Access Token (for Token Auth)",
+            },
+            "placeholders": {
+                "host": "https://{hostname}/api/v3 (for GitHub Enterprise)",
+                "extra": json.dumps(
+                    {
+                        "auth_method": "app_installation_auth",
+                        "app_id": 12345,
+                        "private_key": "Your App's Private Key",
+                        "installation_id": 67890,
+                    },
+                    indent=2,
+                ),
+            },
         }
 
     def test_connection(self) -> tuple[bool, str]:
@@ -87,3 +99,42 @@ class GithubHook(BaseHook):
             return True, "Successfully connected to GitHub."
         except Exception as e:
             return False, str(e)
+
+    @staticmethod
+    def _get_auth(conn: Connection) -> Auth.Auth:
+        """Get the appropriate authentication method based on the connection details."""
+        auth_method = conn.extra_dejson.get("auth_method", "token")
+
+        if auth_method == "token":
+            return GithubHook._get_token_auth(conn)
+        elif auth_method == "app_installation_auth":
+            return GithubHook._get_app_installation_auth(conn)
+        else:
+            raise AirflowException(f"Unsupported auth_method: {auth_method}")
+
+    @staticmethod
+    def _get_token_auth(conn: Connection) -> Auth.Token:
+        """Get the token authentication method."""
+        access_token = conn.password
+        if not access_token:
+            raise AirflowException("An access token is required to authenticate to GitHub.")
+        return Auth.Token(access_token)
+
+    @staticmethod
+    def _get_app_installation_auth(conn: Connection) -> Auth.AppInstallationAuth:
+        """Get the GitHub App installation authentication method."""
+        extras = conn.extra_dejson
+
+        if not isinstance(extras.get("app_id"), (int, str)):
+            raise AirflowException("app_id must be an integer or string.")
+        if not isinstance(extras.get("private_key"), str):
+            raise AirflowException("private_key must be a string.")
+        if not isinstance(extras.get("installation_id"), int):
+            raise AirflowException("installation_id must be an integer.")
+        if not isinstance(extras.get("token_permissions"), (dict, type(None))):
+            raise AirflowException("token_permissions must be a JSON object or None.")
+
+        app_auth = Auth.AppAuth(extras["app_id"], extras["private_key"])
+        return app_auth.get_installation_auth(
+            extras["installation_id"], token_permissions=extras.get("token_permissions")
+        )

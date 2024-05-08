@@ -504,7 +504,7 @@
   },
   "github": {
     "deps": [
-      "PyGithub!=1.58",
+      "PyGithub>=1.59.0",
       "apache-airflow>=2.7.0"
     ],
     "devel-deps": [],
